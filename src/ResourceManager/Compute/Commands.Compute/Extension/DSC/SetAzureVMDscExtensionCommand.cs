@@ -1,17 +1,19 @@
-﻿using System;
+using AutoMapper;
+using Microsoft.Azure.Commands.Compute.Common;
+using Microsoft.Azure.Commands.Compute.Models;
+using Microsoft.Azure.Common.Authentication.Models;
+using Microsoft.Azure.Management.Compute;
+using Microsoft.Azure.Management.Compute.Models;
+using Microsoft.WindowsAzure.Commands.Common.Extensions.DSC;
+using Microsoft.WindowsAzure.Storage;
+using Microsoft.WindowsAzure.Storage.Auth;
+using Microsoft.WindowsAzure.Storage.Blob;
+using System;
 using System.Collections;
 using System.Globalization;
 using System.IO;
 using System.Management.Automation;
 using System.Text.RegularExpressions;
-using AutoMapper;
-using Microsoft.Azure.Commands.Compute.Common;
-using Microsoft.Azure.Commands.Compute.Models;
-using Microsoft.Azure.Management.Compute;
-using Microsoft.Azure.Management.Compute.Models;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Auth;
-using Microsoft.WindowsAzure.Storage.Blob;
 
 namespace Microsoft.Azure.Commands.Compute.Extension.DSC
 {
@@ -21,7 +23,7 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
         SupportsShouldProcess = true,
         DefaultParameterSetName = AzureBlobDscExtensionParamSet)]
     [OutputType(typeof(PSComputeLongRunningOperation))]
-    public class SetAzureVMDscExtensionCommand : VirtualMachineDscExtensionBaseCmdlet
+    public class SetAzureVMDscExtensionCommand : VirtualMachineExtensionBaseCmdlet
     {
         protected const string AzureBlobDscExtensionParamSet = "AzureBlobDscExtension";
 
@@ -43,13 +45,13 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
 
         [Parameter(
             ValueFromPipelineByPropertyName = true,
-            HelpMessage = "Name of the DSC Extension handler. It will default to 'DSC' when it is not provided.")]
+            HelpMessage = "Name of the ARM resource that represents the extension. This is defaulted to 'Microsoft.Powershell.DSC'")]
         [ValidateNotNullOrEmpty]
         public string Name { get; set; }
 
         /// <summary>
         /// The name of the configuration archive that was previously uploaded by 
-        /// Publish-AzureVMDSCConfiguration. This parameter must specify only the name 
+        /// Publish-AzureRmVMDSCConfiguration. This parameter must specify only the name 
         /// of the file, without any path.
         /// A null value or empty string indicate that the VM extension should install DSC,
         /// but not start any configuration
@@ -60,7 +62,7 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
             Position = 5, 
             ValueFromPipelineByPropertyName = true,
             ParameterSetName = AzureBlobDscExtensionParamSet,
-            HelpMessage = "The name of the configuration file that was previously uploaded by Publish-AzureVMDSCConfiguration")]
+            HelpMessage = "The name of the configuration file that was previously uploaded by Publish-AzureRmVMDSCConfiguration")]
         [AllowEmptyString]
         [AllowNull]
         public string ArchiveBlobName { get; set; }
@@ -144,7 +146,7 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
         public string ConfigurationData { get; set; }
 
         /// <summary>
-        /// The specific version of the DSC extension that Set-AzureVMDSCExtension will 
+        /// The specific version of the DSC extension that Set-AzureRmVMDSCExtension will 
         /// apply the settings to. 
         /// </summary>
         [Alias("HandlerVersion")]
@@ -152,13 +154,13 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
             Mandatory = true,
             Position = 1,
             ValueFromPipelineByPropertyName = true,
-            HelpMessage = "The version of the DSC extension that Set-AzureVMDSCExtension will apply the settings to. " +
+            HelpMessage = "The version of the DSC extension that Set-AzureRmVMDSCExtension will apply the settings to. " +
                           "Allowed format N.N")]
         [ValidateNotNullOrEmpty]
         public string Version { get; set; }
 
         /// <summary>
-        /// By default Set-AzureVMDscExtension will not overwrite any existing blobs. Use -Force to overwrite them.
+        /// By default Set-AzureRmVMDscExtension will not overwrite any existing blobs. Use -Force to overwrite them.
         /// </summary>
         [Parameter(
             HelpMessage = "Use this parameter to overwrite any existing blobs")]
@@ -178,8 +180,33 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
         [Parameter(
             HelpMessage = "Extension handler gets auto updated to the latest version if this switch is present.")]
         public SwitchParameter AutoUpdate { get; set; }
-        //Private Variables
 
+        /// <summary>
+        /// Specifies the version of the Windows Management Framework (WMF) to install 
+        /// on the VM.
+        ///
+        /// The DSC Azure Extension depends on DSC features that are only available in 
+        /// the WMF updates. This parameter specifies which version of the update to 
+        /// install on the VM. The possible values are "4.0","latest" and "5.0PP".  
+        /// 
+        /// A value of "4.0" will install KB3000850 
+        /// (http://support.microsoft.com/kb/3000850) on Windows 8.1 or Windows Server 
+        /// 2012 R2, or WMF 4.0 
+        /// (http://www.microsoft.com/en-us/download/details.aspx?id=40855) on other 
+        /// versions of Windows if a newer version isnt already installed.
+        /// 
+        /// A value of "5.0PP" will install the latest release of WMF 5.0PP 
+        /// (http://go.microsoft.com/fwlink/?LinkId=398175).
+        /// 
+        /// A value of "latest" will install the latest WMF, currently WMF 5.0PP
+        /// 
+        /// The default value is "latest"
+        /// </summary>
+        [Parameter(ValueFromPipelineByPropertyName = true)]
+        [ValidateSetAttribute(new[] { "4.0", "latest", "5.0PP" })]
+        public string WmfVersion { get; set; }
+
+        //Private Variables
         private const string VersionRegexExpr = @"^(([0-9])\.)\d+$";
 
         /// <summary>
@@ -187,9 +214,9 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
         /// </summary>
         private StorageCredentials _storageCredentials;
 
-        public override void ExecuteCmdlet()
+        protected override void ProcessRecord()
         {
-            base.ExecuteCmdlet();
+            base.ProcessRecord();
 
             ValidateParameters();
 
@@ -204,11 +231,11 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
                 if (ConfigurationName != null || ConfigurationArgument != null
                     || ConfigurationData != null)
                 {
-                    ThrowInvalidArgumentError(Properties.Resources.AzureVMDscNullArchiveNoConfiguragionParameters);
+                    this.ThrowInvalidArgumentError(Microsoft.Azure.Commands.Compute.Properties.Resources.AzureVMDscNullArchiveNoConfiguragionParameters);
                 }
                 if (ArchiveContainerName != null || ArchiveStorageEndpointSuffix != null)
                 {
-                    ThrowInvalidArgumentError(Properties.Resources.AzureVMDscNullArchiveNoStorageParameters);
+                    this.ThrowInvalidArgumentError(Microsoft.Azure.Commands.Compute.Properties.Resources.AzureVMDscNullArchiveNoStorageParameters);
                 }
             }
             else
@@ -218,7 +245,7 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
                     ArchiveBlobName,
                     StringComparison.InvariantCultureIgnoreCase) != 0)
                 {
-                    ThrowInvalidArgumentError(Properties.Resources.AzureVMDscConfigurationDataFileShouldNotIncludePath);
+                    this.ThrowInvalidArgumentError(Microsoft.Azure.Commands.Compute.Properties.Resources.AzureVMDscConfigurationDataFileShouldNotIncludePath);
                 }
 
                 if (ConfigurationData != null)
@@ -227,8 +254,8 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
 
                     if (!File.Exists(ConfigurationData))
                     {
-                        ThrowInvalidArgumentError(
-                            Properties.Resources.AzureVMDscCannotFindConfigurationDataFile,
+                        this.ThrowInvalidArgumentError(
+                            Microsoft.Azure.Commands.Compute.Properties.Resources.AzureVMDscCannotFindConfigurationDataFile,
                             ConfigurationData);
                     }
                     if (string.Compare(
@@ -236,7 +263,7 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
                         ".psd1",
                         StringComparison.InvariantCultureIgnoreCase) != 0)
                     {
-                        ThrowInvalidArgumentError(Properties.Resources.AzureVMDscInvalidConfigurationDataFile);
+                        this.ThrowInvalidArgumentError(Microsoft.Azure.Commands.Compute.Properties.Resources.AzureVMDscInvalidConfigurationDataFile);
                     }
                 }
 
@@ -245,7 +272,7 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
                     ArchiveResourceGroupName = ResourceGroupName;
                 }
 
-                _storageCredentials = GetStorageCredentials(ArchiveResourceGroupName, ArchiveStorageAccountName);
+                _storageCredentials = this.GetStorageCredentials(ArchiveResourceGroupName, ArchiveStorageAccountName);
 
                 if (ConfigurationName == null)
                 {
@@ -254,12 +281,18 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
 
                 if (ArchiveContainerName == null)
                 {
-                    ArchiveContainerName = DefaultContainerName;
+                    ArchiveContainerName = DscExtensionCmdletConstants.DefaultContainerName;
+                }
+
+                if (ArchiveStorageEndpointSuffix == null)
+                {
+                    ArchiveStorageEndpointSuffix =
+                        DefaultProfile.Context.Environment.GetEndpoint(AzureEnvironment.Endpoint.StorageEndpointSuffix);
                 }
 
                 if (!(Regex.Match(Version, VersionRegexExpr).Success))
                 {
-                    ThrowInvalidArgumentError(Properties.Resources.AzureVMDscExtensionInvalidVersion);
+                    this.ThrowInvalidArgumentError(Microsoft.Azure.Commands.Compute.Properties.Resources.AzureVMDscExtensionInvalidVersion);
                 }
             }
         }
@@ -268,7 +301,9 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
         {
             var publicSettings = new DscExtensionPublicSettings();
             var privateSettings = new DscExtensionPrivateSettings();
-            
+
+            publicSettings.WmfVersion = string.IsNullOrEmpty(WmfVersion) ? "latest" : WmfVersion;
+
             if (!string.IsNullOrEmpty(ArchiveBlobName))
             {
                 ConfigurationUris configurationUris = UploadConfigurationDataToBlob();
@@ -281,7 +316,7 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
                     Path.GetFileNameWithoutExtension(ArchiveBlobName),
                     ConfigurationName);
                 Tuple<DscExtensionPublicSettings.Property[], Hashtable> settings =
-                    DscSettingsSerializer.SeparatePrivateItems(ConfigurationArgument);
+                    DscExtensionSettingsSerializer.SeparatePrivateItems(ConfigurationArgument);
                 publicSettings.Properties = settings.Item1;
                 privateSettings.Items = settings.Item2;
 
@@ -291,16 +326,16 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
             var parameters = new VirtualMachineExtension
             {
                 Location = Location,
-                Name = Name ?? ExtensionNamespace + "." + ExtensionName,
+                Name = Name ?? DscExtensionCmdletConstants.ExtensionPublishedNamespace + "." + DscExtensionCmdletConstants.ExtensionPublishedName,
                 Type = VirtualMachineExtensionType,
-                Publisher = ExtensionNamespace,
-                ExtensionType = ExtensionName,
+                Publisher = DscExtensionCmdletConstants.ExtensionPublishedNamespace,
+                ExtensionType = DscExtensionCmdletConstants.ExtensionPublishedName,
                 TypeHandlerVersion = Version,
                 // Define the public and private property bags that will be passed to the extension.
-                Settings = DscSettingsSerializer.SerializePublicSettings(publicSettings),
+                Settings = DscExtensionSettingsSerializer.SerializePublicSettings(publicSettings),
                 //PrivateConfuguration contains sensitive data in a plain text
-                ProtectedSettings = DscSettingsSerializer.SerializePrivateSettings(privateSettings),
-                AutoUpgradeMinorVersion = AutoUpdate.IsPresent ? true : false
+                ProtectedSettings = DscExtensionSettingsSerializer.SerializePrivateSettings(privateSettings),
+                AutoUpgradeMinorVersion = AutoUpdate.IsPresent
             };
 
             //Add retry logic due to CRP service restart known issue CRP bug: 3564713
@@ -335,12 +370,7 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
             //
             // Get a reference to the container in blob storage
             //
-            var storageAccount = string.IsNullOrEmpty(ArchiveStorageEndpointSuffix)
-                                     ? new CloudStorageAccount(_storageCredentials, true)
-                                     : new CloudStorageAccount(
-                                           _storageCredentials,
-                                           ArchiveStorageEndpointSuffix,
-                                           true);
+            var storageAccount = new CloudStorageAccount(_storageCredentials, ArchiveStorageEndpointSuffix, true); 
 
             var blobClient = storageAccount.CreateCloudBlobClient();
 
@@ -367,28 +397,28 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
 
             if (ConfigurationData != null)
             {
+                var guid = Guid.NewGuid();
+                // there may be multiple VMs using the same configuration
+
+                var configurationDataBlobName = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "{0}-{1}.psd1",
+                    ConfigurationName,
+                    guid);
+
+                var configurationDataBlobReference =
+                    containerReference.GetBlockBlobReference(configurationDataBlobName);
+                
                 ConfirmAction(
                     true,
                     string.Empty,
                     string.Format(
                         CultureInfo.CurrentUICulture,
-                        Properties.Resources.AzureVMDscUploadToBlobStorageAction,
+                        Microsoft.Azure.Commands.Compute.Properties.Resources.AzureVMDscUploadToBlobStorageAction,
                         ConfigurationData),
-                    configurationBlobReference.Uri.AbsoluteUri,
+                    configurationDataBlobReference.Uri.AbsoluteUri,
                     () =>
                     {
-                        var guid = Guid.NewGuid();
-                        // there may be multiple VMs using the same configuration
-
-                        var configurationDataBlobName = string.Format(
-                            CultureInfo.InvariantCulture,
-                            "{0}-{1}.psd1",
-                            ConfigurationName,
-                            guid);
-
-                        var configurationDataBlobReference =
-                            containerReference.GetBlockBlobReference(configurationDataBlobName);
-
                         if (!Force && configurationDataBlobReference.Exists())
                         {
                             ThrowTerminatingError(
@@ -396,7 +426,7 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
                                     new UnauthorizedAccessException(
                                         string.Format(
                                             CultureInfo.CurrentUICulture,
-                                            Properties.Resources.AzureVMDscStorageBlobAlreadyExists,
+                                            Microsoft.Azure.Commands.Compute.Properties.Resources.AzureVMDscStorageBlobAlreadyExists,
                                             configurationDataBlobName)),
                                     "StorageBlobAlreadyExists",
                                     ErrorCategory.PermissionDenied,
@@ -432,3 +462,4 @@ namespace Microsoft.Azure.Commands.Compute.Extension.DSC
         }
     }
 }
+
